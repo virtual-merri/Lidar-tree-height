@@ -9,6 +9,7 @@
   <link rel="stylesheet"
     href="https://js.arcgis.com/5.1/esri/themes/light/main.css" />
   <script type="module" src="https://js.arcgis.com/5.1/"></script>
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 
   <style>
     html, body {
@@ -104,7 +105,7 @@
 
     .section-label {
       margin-top: 16px;
-      font-size: 12px;
+      font-size: 17px;
       font-weight: bold;
       color: #555;
       text-transform: uppercase;
@@ -120,6 +121,17 @@
     .slider-control {
       margin-top: 14px;
     }
+
+    #coordinate-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #ddd;
+      font-size: 12px;
+      line-height: 1.5;
+      pointer-events: none;
+    }
+
+    #coordinates { font-family: Consolas, monospace; overflow-wrap: anywhere; }
 
     .slider-control label {
       display: flex;
@@ -161,7 +173,7 @@
   </arcgis-scene>
 
   <div class="panel" id="controls-panel">
-    <div class="heading">3D Tools</div>
+    <div class="heading">Camera settings</div>
 
     <button id="eye-level-button">
       Set eye level (1.8 m)
@@ -186,9 +198,6 @@
         step="1"
         value="55"
       />
-      <div class="hint">
-        Narrower view = more zoomed-in perspective; wider view = more surroundings.
-      </div>
     </div>
 
     <div class="hint">
@@ -197,9 +206,28 @@
 
     <div class="section-label">LiDAR</div>
 
+    <div class="slider-control">
+      <label for="point-size-slider">
+        <span>LiDAR point size</span>
+        <strong id="point-size-value">5</strong>
+      </label>
+      <input id="point-size-slider" type="range" min="1" max="15" step="0.5" value="5" />
+      <div class="hint">Adjust the displayed size of each point.</div>
+    </div>
+
+    <div class="slider-control">
+      <label for="point-density-slider">
+        <span>LiDAR point density</span>
+        <strong id="point-density-value">100%</strong>
+      </label>
+      <input id="point-density-slider" type="range" min="10" max="100" step="5" value="100" />
+      <div class="hint">Lower values render fewer points and may improve performance.</div>
+    </div>
+
     <button id="renderer-button" class="secondary">
       Switch LiDAR to Elevation
     </button>
+    <button id="screenshot-button" class="secondary">Export screenshot (PNG)</button>
 
     <button id="zoom-button" class="secondary" disabled>
       Zoom to selected point
@@ -209,11 +237,12 @@
       Clear selected point
     </button>
 
-    <div class="section-label">Scene layers</div>
+    <div class="section-label">Layers</div>
 
     <button id="buildings-button" class="secondary">
       Hide building models
     </button>
+    <button id="boundaries-button" class="secondary">Hide property boundaries</button>
 
     <button id="basemap-button" class="secondary">
       Switch to grey basemap
@@ -225,6 +254,10 @@
     <div>Height above ground</div>
     <div id="height">Ready</div>
     <div id="details">Click a LiDAR point to begin.</div>
+    <div id="coordinate-section">
+      <div class="heading">Cursor coordinates</div>
+      <div id="coordinates">Move cursor over the scene</div>
+    </div>
   </div>
 
   <script type="module">
@@ -242,6 +275,13 @@
     const rendererButton = document.querySelector("#renderer-button");
     const fovSlider = document.querySelector("#fov-slider");
     const fovValue = document.querySelector("#fov-value");
+    const pointSizeSlider = document.querySelector("#point-size-slider");
+    const pointSizeValue = document.querySelector("#point-size-value");
+    const pointDensitySlider = document.querySelector("#point-density-slider");
+    const pointDensityValue = document.querySelector("#point-density-value");
+    const screenshotButton = document.querySelector("#screenshot-button");
+    const boundariesButton = document.querySelector("#boundaries-button");
+    const coordinatesText = document.querySelector("#coordinates");
 
     const EYE_HEIGHT = 1.8;
     const MOVE_SPEED = 3.0;
@@ -258,9 +298,13 @@
     let lastMouseY = null;
     let mouseLooking = false;
     let currentRendererMode = "RGB";
+    let currentPointSize = Number(pointSizeSlider.value);
+    let currentPointDensity = Number(pointDensitySlider.value);
+    let coordinateRequestId = 0;
 
     const savedRenderers = new Map();
     const savedBuildingVisibility = new Map();
+    const savedBoundaryVisibility = new Map();
     const rendererCache = new Map();
     const keysDown = new Set();
 
@@ -325,6 +369,15 @@
       );
     }
 
+    function boundaryLayers() {
+      return allLayers().filter(layer => {
+        if (layer === selectionLayer || layer.type === "point-cloud") return false;
+        const description = [layer.title, layer.portalItem?.title, layer.type]
+          .filter(Boolean).join(" ").toLowerCase();
+        return /property|parcel|cadastral|lot boundary|property boundary/.test(description);
+      });
+    }
+
     function buildingLayers() {
       return allLayers().filter(layer => {
         if (layer === selectionLayer) return false;
@@ -343,6 +396,48 @@
     }
 
     const buildings = buildingLayers();
+    const boundaries = boundaryLayers();
+
+    boundaries.forEach(layer => savedBoundaryVisibility.set(layer, layer.visible));
+    // If no property layer is already in the scene, the toggle can load the
+    // public Vicmap Property Map Polygons service on demand.
+    let vicmapPropertyLayer = boundaries.find(layer =>
+      /vicmap property/i.test([layer.title, layer.portalItem?.title].filter(Boolean).join(" "))
+    ) || null;
+
+    // Add the public Vicmap Property layer automatically and show it by default.
+    if (!vicmapPropertyLayer) {
+      const [FeatureLayer] = await $arcgis.import([
+        "@arcgis/core/layers/FeatureLayer.js"
+      ]);
+      vicmapPropertyLayer = new FeatureLayer({
+        title: "Vicmap Property — Property Map Polygons",
+        url: "https://services-ap1.arcgis.com/P744lA0wf4LlBZ84/ArcGIS/rest/services/Vicmap_Property/FeatureServer/0",
+        visible: true,
+        outFields: ["*"],
+        elevationInfo: { mode: "on-the-ground" },
+        renderer: {
+          type: "simple",
+          symbol: {
+            type: "simple-fill",
+            color: [255, 0, 0, 0],
+            outline: { color: [255, 0, 0, 235], width: 1.4 }
+          }
+        },
+        popupEnabled: false
+      });
+      view.map.add(vicmapPropertyLayer);
+      try {
+        await vicmapPropertyLayer.load();
+        savedBoundaryVisibility.set(vicmapPropertyLayer, true);
+      } catch (error) {
+        console.error("Could not load Vicmap Property by default:", error);
+        boundariesButton.textContent = "Retry property boundaries";
+      }
+    }
+    boundariesButton.textContent = vicmapPropertyLayer?.visible
+      ? "Hide property boundaries"
+      : "Show property boundaries";
 
     buildings.forEach(layer => {
       savedBuildingVisibility.set(layer, layer.visible);
@@ -359,6 +454,132 @@
 
     pointCloudLayers().forEach(layer => {
       savedRenderers.set(layer, layer.renderer);
+    });
+
+    function rendererWithPointSize(renderer, size) {
+      const adjusted = renderer?.clone ? renderer.clone() : renderer;
+      if (adjusted) {
+        adjusted.pointSizeAlgorithm = {
+          type: "fixed-size",
+          useRealWorldSymbolSizes: false,
+          size: Number(size)
+        };
+      }
+      return adjusted;
+    }
+
+    function applyPointSize(size) {
+      currentPointSize = Number(size);
+      pointSizeValue.textContent = String(currentPointSize);
+      pointCloudLayers().forEach(layer => {
+        if (layer.renderer) layer.renderer = rendererWithPointSize(layer.renderer, currentPointSize);
+      });
+    }
+
+    pointSizeSlider.addEventListener("input", () => applyPointSize(pointSizeSlider.value));
+
+    // Density is expressed as a percentage of the layer's configured point density.
+    // ArcGIS exposes pointsPerInch on PointCloudLayer; preserve each layer's starting value.
+    const originalDensity = new Map();
+    pointCloudLayers().forEach(layer => {
+      if (Number.isFinite(layer.pointsPerInch)) originalDensity.set(layer, layer.pointsPerInch);
+    });
+    pointDensitySlider.addEventListener("input", () => {
+      currentPointDensity = Number(pointDensitySlider.value);
+      pointDensityValue.textContent = `${currentPointDensity}%`;
+      pointCloudLayers().forEach(layer => {
+        const base = originalDensity.get(layer);
+        if (Number.isFinite(base)) layer.pointsPerInch = base * currentPointDensity / 100;
+      });
+    });
+
+    // Export the rendered 3D scene plus the on-screen tool, coordinates and height panels.
+    screenshotButton.addEventListener("click", async () => {
+      screenshotButton.disabled = true;
+      const oldLabel = screenshotButton.textContent;
+      screenshotButton.textContent = "Capturing…";
+      try {
+        const shot = await view.takeScreenshot({ format: "png" });
+        const sceneImage = new Image();
+        sceneImage.src = shot.dataUrl;
+        await new Promise((resolve, reject) => {
+          sceneImage.onload = resolve;
+          sceneImage.onerror = reject;
+        });
+
+        const output = document.createElement("canvas");
+        output.width = sceneImage.naturalWidth;
+        output.height = sceneImage.naturalHeight;
+        const ctx = output.getContext("2d");
+        ctx.drawImage(sceneImage, 0, 0, output.width, output.height);
+
+        if (typeof window.html2canvas !== "function") {
+          throw new Error("The screenshot overlay library did not load.");
+        }
+
+        const scaleX = output.width / view.container.getBoundingClientRect().width;
+        const scaleY = output.height / view.container.getBoundingClientRect().height;
+        for (const panel of [
+          document.querySelector("#controls-panel"),
+          document.querySelector("#result-panel")
+        ]) {
+          const panelCanvas = await window.html2canvas(panel, {
+            backgroundColor: null,
+            scale: Math.max(scaleX, scaleY),
+            useCORS: true,
+            logging: false
+          });
+          const rect = panel.getBoundingClientRect();
+          const sceneRect = view.container.getBoundingClientRect();
+          ctx.drawImage(
+            panelCanvas,
+            (rect.left - sceneRect.left) * scaleX,
+            (rect.top - sceneRect.top) * scaleY,
+            rect.width * scaleX,
+            rect.height * scaleY
+          );
+        }
+
+        const link = document.createElement("a");
+        link.href = output.toDataURL("image/png");
+        link.download = `lidar-inspector-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      } catch (error) {
+        console.error("Screenshot export failed:", error);
+        alert("Could not export the full screenshot. Check that the page is online and reload it, then try again.");
+      } finally {
+        screenshotButton.disabled = false;
+        screenshotButton.textContent = oldLabel;
+      }
+    });
+
+    // Convert cursor position to a scene map point and display XYZ coordinates.
+    scene.addEventListener("arcgisViewPointerMove", async event => {
+      const native = event.detail?.native;
+      if (!native || mouseLooking) return;
+      const requestId = ++coordinateRequestId;
+      const rect = view.container.getBoundingClientRect();
+      const mapPoint = await view.toMap({
+        x: native.clientX - rect.left,
+        y: native.clientY - rect.top
+      });
+      if (requestId !== coordinateRequestId) return;
+      if (!mapPoint) {
+        coordinatesText.textContent = "No surface coordinate";
+        return;
+      }
+      const sr = mapPoint.spatialReference;
+      const srLabel = sr?.wkid ?? sr?.latestWkid ?? "unknown SR";
+      coordinatesText.textContent = `X: ${mapPoint.x.toFixed(3)}
+Y: ${mapPoint.y.toFixed(3)}
+Z: ${Number.isFinite(mapPoint.z) ? mapPoint.z.toFixed(3) : "—"}
+WKID: ${srLabel}`;
+    });
+    scene.addEventListener("arcgisViewPointerLeave", () => {
+      coordinateRequestId++;
+      coordinatesText.textContent = "Move cursor over the scene";
     });
 
     // FIX 1:
@@ -773,6 +994,17 @@
       buildingsButton.classList.toggle("active", !newVisibility);
     });
 
+    boundariesButton.addEventListener("click", () => {
+      const anyVisible = boundaries.some(layer => layer.visible) || Boolean(vicmapPropertyLayer?.visible);
+      const nextVisible = !anyVisible;
+      boundaries.forEach(layer => { layer.visible = nextVisible; });
+      if (vicmapPropertyLayer) vicmapPropertyLayer.visible = nextVisible;
+      boundariesButton.textContent = nextVisible
+        ? "Hide property boundaries"
+        : "Show property boundaries";
+      boundariesButton.classList.toggle("active", !nextVisible);
+    });
+
     basemapButton.addEventListener("click", async () => {
       basemapButton.disabled = true;
 
@@ -854,7 +1086,7 @@
         }
 
         generated.forEach(item => {
-          item.layer.renderer = item.renderer;
+          item.layer.renderer = rendererWithPointSize(item.renderer, currentPointSize);
         });
 
         currentRendererMode = nextMode;
