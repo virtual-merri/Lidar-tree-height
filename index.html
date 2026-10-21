@@ -92,10 +92,10 @@
 
           // Sample the scene's configured ground at the
           // SAME X/Y location as the selected LiDAR point.
-          const groundPoint = await scene.view.map.ground
-            .queryElevation(point);
+const groundResult = await scene.view.map.ground
+  .queryElevation(point);
 
-          const groundZ = groundPoint?.z;
+const groundZ = groundResult?.geometry?.z;
 
           if (!Number.isFinite(groundZ)) {
             heightText.textContent = "No ground elevation";
